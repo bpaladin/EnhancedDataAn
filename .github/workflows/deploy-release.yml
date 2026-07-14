@@ -1,0 +1,58 @@
+name: Deploy Release
+# Запускается ТОЛЬКО когда делаешь git push с тегом, например: git push origin v1.2.3
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            pyinstaller_path_sep: ':'
+            exe_ext: ''
+          - os: windows-latest
+            pyinstaller_path_sep: ';'
+            exe_ext: .exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --prefer-binary -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable
+        run: |
+          pyinstaller --clean --onefile \
+            --paths="${{ github.workspace }}" \
+            --hidden-import=analyzer_enhanced \
+            --add-data "analyzer_enhanced.py${{ matrix.pyinstaller_path_sep }}." \
+            --name "EnhancedDataAn" main.py
+
+      - name: Upload artifacts to Release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          body: |
+            Автоматически собранный релиз.
+            Версия: ${{ github.ref_name }}
+            Коммит: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          files: dist/EnhancedDataAn${{ matrix.exe_ext }}

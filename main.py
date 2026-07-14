@@ -4,17 +4,32 @@ DataAn Enhanced — CLI-версия
 Интерактивный командный строковый статистический анализ на базе DataAnalyzer.
 """
 import sys
-import os
 import glob
 import fnmatch
 import webbrowser
 import warnings
 import shutil
-
+import pandas as pd
+import importlib.util
+import os
 warnings.filterwarnings('ignore')
 
-import pandas as pd
-from analyzer_enhanced import DataAnalyzer
+def load_analyzer():
+    if getattr(sys, 'frozen', False):
+        # Запущено из собранного EXE — файл лежит в распакованной папке
+        base_path = sys._MEIPASS
+    else:
+        # Обычный запуск из интерпретатора — файл рядом
+        base_path = os.path.dirname(os.path.abspath(__file__))
+
+    module_path = os.path.join(base_path, 'analyzer_enhanced.py')
+    spec = importlib.util.spec_from_file_location('analyzer_enhanced', module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+analyzer_enhanced = load_analyzer()
+DataAnalyzer = analyzer_enhanced.DataAnalyzer
 
 # ─────────────────── ANSI цвета для терминала ───────────────────
 class C:
