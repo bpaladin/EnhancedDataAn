@@ -25,9 +25,10 @@ jobs:
           
       - name: Build executable
         run: |
-          pyinstaller --clean --onefile --paths=. \
+          pyinstaller --clean --onefile --paths="${{ github.workspace }}" \
             --hidden-import=analyzer_enhanced \
-            --name "EnhancedDataAn" main.py   
+            --add-data "analyzer_enhanced.py:." \
+            --name "EnhancedDataAn" main.py
             
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -58,7 +59,7 @@ jobs:
           
       - name: Build EXE
         # --paths=. и --hidden-import для фикса ошибки с модулем
-        run: pyinstaller --clean --onefile --paths=. --hidden-import=analyzer_enhanced --name "EnhancedDataAn" --icon=icon.ico main.py
+        run: pyinstaller --clean --onefile --paths=. --hidden-import=analyzer_enhanced --add-data "analyzer_enhanced.py;." --name "EnhancedDataAn" --icon=icon.ico main.py        
         
       - name: Upload artifact
         uses: actions/upload-artifact@v4

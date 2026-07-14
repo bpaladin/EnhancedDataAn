@@ -1374,7 +1374,9 @@ class DataAnalyzer:
         all_factor_results = {}
         p_values_all = []
         try:
-            formula_full = f'{dep_str} ~ {" + ".join([f"C(Q(\"{f}\"))" for f in cat_factors])}'
+            #formula_full = f'{dep_str} ~ {" + ".join([f"C(Q(\"{f}\"))" for f in cat_factors])}'
+            cat_terms = " + ".join([f'C(Q("{f}"))' for f in cat_factors])
+            formula_full = f'{dep_str} ~ {cat_terms}'
             manova_result = _run_manova(formula_full, self._current_df)
             for factor in cat_factors:
                 all_factor_results[factor] = _extract_factor_results(manova_result, factor)
