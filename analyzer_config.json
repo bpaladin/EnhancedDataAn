@@ -1,0 +1,9 @@
+{
+  "precision": 3,
+  "correlation_threshold": 0.9,
+  "z_score_threshold": 3.0,
+  "remove_outliers": true,
+  "balance_groups": false,
+  "bootstrap_min_size": 30,
+  "bootstrap_max_ratio": 3.0
+}

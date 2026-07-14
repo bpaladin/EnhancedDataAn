@@ -1,0 +1,26 @@
+{
+  "last_file_path": "Aromaterapia10_dannye_EEG_with_clusters.xlsx",
+  "last_file_name": "Aromaterapia10_dannye_EEG_with_clusters.xlsx",
+  "last_params": {
+    "group": "Проба",
+    "analysis": "ЭПЧ_A",
+    "multi": [
+      "ЭПЧ_D2",
+      "ЭПЧ_T",
+      "ЭПЧ_A",
+      "ЭПЧ_B1",
+      "ЭПЧ_B2",
+      "АЗА_D1",
+      "АЗА_D2",
+      "АЗА_T",
+      "АЗА_A",
+      "АЗА_B1",
+      "АЗА_B2"
+    ],
+    "cat_multi": [
+      "пол",
+      "Проба",
+      "Отведение"
+    ]
+  }
+}
