@@ -1,29 +1,17 @@
 {
-  "last_file_path": "Aromaterapia10_dannye_EEG_with_clusters.xlsx",
-  "last_file_name": "Aromaterapia10_dannye_EEG_with_clusters.xlsx",
+  "last_file_path": "Фоновая ээг лиц с высокой и низкой внушаемостью.xlsx",
+  "last_file_name": "Фоновая ээг лиц с высокой и низкой внушаемостью.xlsx",
   "last_params": {
-    "group": "Проба",
-    "analysis": "ОКА_A",
+    "group": "внушаемость",
+    "analysis": "тета амплитуда",
     "multi": [
-      "ОКА_D1",
-      "ОКА_A",
-      "КЧА_D1",
-      "КЧА_D2",
-      "КЧА_T",
-      "КЧА_A",
-      "КЧА_B1",
-      "КЧА_B2",
-      "АКА_D1",
-      "АКА_D2",
-      "АКА_T",
-      "АКА_A",
-      "АКА_B1",
-      "АКА_B2"
+      "тета амплитуда",
+      "тета частота",
+      "альфа амплитуда",
+      "альфа частота"
     ],
     "cat_multi": [
-      "пол",
-      "Проба",
-      "Отведение"
+      "пол"
     ]
   }
 }
