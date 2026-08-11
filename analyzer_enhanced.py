@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-analyzer_enhanced.py — Вычислительное ядро статистического анализа v2.1
+analyzer_enhanced.py — Вычислительное ядро статистического анализа v1.1
 Полная версия с HTML-отображением результатов.
 """
 import logging
@@ -11,10 +11,10 @@ import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List
 from itertools import combinations
 from scipy import stats as sp_stats
-from scipy.stats import chi2_contingency, fisher_exact, shapiro, levene, kruskal
+from scipy.stats import chi2_contingency, shapiro, levene, kruskal
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
@@ -25,14 +25,12 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.svm import SVC
 from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix,
+from sklearn.metrics import (accuracy_score, confusion_matrix,
                              roc_auc_score, roc_curve, r2_score, mean_squared_error)
 from statsmodels.formula.api import ols
 from statsmodels.stats.anova import anova_lm
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from statsmodels.multivariate.manova import MANOVA
-import statsmodels.api as sm
-
 try:
     import xgboost as xgb
     _XGB_AVAILABLE = True
@@ -61,6 +59,14 @@ def decode_bdata(obj):
         if 'bdata' in obj and 'dtype' in obj:
             try:
                 decoded = np.frombuffer(_b64.b64decode(obj['bdata']), dtype=obj.get('dtype', 'f8'))
+                shape = obj.get('shape')
+                if shape:
+                    try:
+                        shape = tuple(int(s) for s in re.findall(r'\d+', str(shape)))
+                        if len(shape) > 1:
+                            return decoded.reshape(shape).tolist()
+                    except Exception:
+                        pass
                 return decoded.tolist()
             except Exception:
                 return obj
@@ -74,6 +80,31 @@ def fig_to_json(fig):
     d = decode_bdata(fig.to_dict())
     raw = json.dumps(d, cls=NumpyEncoder, ensure_ascii=False)
     return raw.replace('</script>', '<\\/script>')
+
+def _beeswarm_offsets(vals, width=0.35, seed=42):
+    """Смещения точек по оси X для диаграммы роя (beeswarm).
+
+    Разброс зависит от локальной плотности распределения: вблизи моды точки
+    располагаются теснее, на «хвостах» — шире.
+    """
+    import numpy as np
+    from scipy.stats import gaussian_kde
+    vals = np.asarray(vals, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    n = len(vals)
+    if n == 0:
+        return np.array([])
+    rng = np.random.RandomState(seed)
+    try:
+        if n >= 3:
+            dens = gaussian_kde(vals).pdf(vals)
+            dens = np.clip(dens, 1e-12, None)
+            scale = (1.0 - dens / dens.max()) ** 0.5
+        else:
+            scale = np.full(n, 0.7)
+    except Exception:
+        scale = np.full(n, 0.7)
+    return rng.uniform(-1, 1, n) * width * scale
 
 STAT_TABLE_CSS = '''
 .stat-table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.95em; }
@@ -871,8 +902,7 @@ class DataAnalyzer:
             sig_tests = [t for t in test_names_ordered if t in factor_res and factor_res[t]['p'] <= 0.05]
             if sig_tests:
                 summary_parts.append(
-                    f'<li><b>{factor}</b>: <span style="color:green;">ЗНАЧИМ</span> '
-                    f'(значимо по: {", ".join(sig_tests)})</li>')
+                    f'<li><b>{factor}</b>: <span style="color:green;">ЗНАЧИМ</span></li>')
             elif any(t in factor_res for t in test_names_ordered):
                 summary_parts.append(
                     f'<li><b>{factor}</b>: <span style="color:#c0392b;">НЕ ЗНАЧИМ</span></li>')
@@ -1064,8 +1094,16 @@ class DataAnalyzer:
         num_preds = [c for c in self.params.get('multi', [])
                      if c in self._current_df.columns
                      and pd.api.types.is_numeric_dtype(self._current_df[c])]
-        if not cat_preds or self._current_df[g_col].nunique() < 2:
+        if self._current_df[g_col].nunique() < 2:
             self._analysis_results['logistic_reg_cat'] = {'text': '', 'html': ''}
+            return ''
+        if not cat_preds:
+            self._analysis_results['logistic_reg_cat'] = {
+                'text': '',
+                'html': ('<p style="color:#7f8c8d; font-style:italic;">'
+                         'Логистическая регрессия не выполнялась: не были выбраны '
+                         'качественные (категориальные) признаки.</p>')
+            }
             return ''
         predictors = cat_preds + num_preds
         data = self._current_df[predictors + [g_col]].dropna()
@@ -1162,8 +1200,8 @@ class DataAnalyzer:
         rfe.fit(X, y)
         selected = [f for f, s in zip(X.columns, rfe.support_) if s]
         eliminated = [f for f, s in zip(X.columns, rfe.support_) if not s]
-        text = (f"RFE рекомендует оставить ({len(selected)}): {', '.join(selected)}\n"
-                f"RFE рекомендует убрать ({len(eliminated)}): {', '.join(eliminated)}")
+        text = (f"Рекомендуется оставить ({len(selected)}): {', '.join(selected)}\n"
+                f"Рекомендуется убрать ({len(eliminated)}): {', '.join(eliminated)}")
         self._analysis_results['rfe'] = {'selected': selected, 'eliminated': eliminated, 'text': text}
         return text
 
@@ -1468,6 +1506,17 @@ class DataAnalyzer:
                 f'<tr><th>Место</th><th>Модель</th><th>Accuracy (mean ± std)</th>'
                 f'<th>AUC (mean ± std)</th><th>Повторений</th></tr>\n{html_rows}</table>'
             )
+
+            print('Бенчмарк моделей (точность на отложенной выборке, mean ± std по '
+                  f'{rows_sorted[0]["n_repeats"]} повторам):')
+            print('  ' + '-' * 60)
+            for i, r in enumerate(rows_sorted, 1):
+                medal = {1: '🥇', 2: '🥈', 3: '🥉'}.get(i, f'{i}.')
+                print(f'  {medal} {r["model"]:<22} accuracy: {r["accuracy"]:<14} AUC: {r["auc"]}')
+            print('  ' + '-' * 60)
+            best_m = rows_sorted[0]
+            print(f'  🏆 Лучшая модель: {best_m["model"]} (accuracy {best_m["accuracy"]}, AUC {best_m["auc"]})')
+
             best_key = max(model_labels.keys(),
                            key=lambda k: self._analysis_results.get(k, {}).get('accuracy_mean', 0)
                            if k in self._analysis_results else 0)
@@ -1486,6 +1535,7 @@ class DataAnalyzer:
             }
         else:
             self._analysis_results['ml_benchmark'] = {'text': '', 'html': ''}
+            print('Модели не обучены: недостаточно данных или признаков для классификации.')
 
     # ====================== МЕЖВЫБОРОЧНЫЕ СРАВНЕНИЯ ======================
     def perform_between_sample_comparison(self):
@@ -1556,7 +1606,7 @@ class DataAnalyzer:
         
         fig = make_subplots(rows=1, cols=2, 
                             subplot_titles=(f'Скрипичная диаграмма: {a_col}', 
-                                           f'Рояль-диаграмма: {a_col}'))
+                                           f'Диаграмма роя: {a_col}'))
         
         groups = sorted(self._current_df[g_col].unique(), key=str)
         colors = px.colors.qualitative.Set2
@@ -1568,12 +1618,20 @@ class DataAnalyzer:
                                     meanline_visible=True, line_color=colors[i % len(colors)],
                                     points='outliers'), row=1, col=1)
         
-        # Правый график - violin с box
+        # Правый график - диаграмма роя (beeswarm): точки с разбросом,
+        # зависящим от локальной плотности распределения
         for i, g in enumerate(groups):
             vals = self._current_df[self._current_df[g_col] == g][a_col].dropna()
-            fig.add_trace(go.Violin(y=vals, name=str(g), box_visible=True,
-                                    meanline_visible=False, line_color=colors[i % len(colors)],
-                                    points=False), row=1, col=2)
+            if vals.empty:
+                continue
+            offsets = _beeswarm_offsets(vals)
+            fig.add_trace(go.Scatter(
+                y=vals.to_numpy(), x=i + offsets, mode='markers',
+                marker=dict(color=colors[i % len(colors)], size=5, opacity=0.75,
+                            line=dict(width=0.4, color='white')),
+                name=str(g), showlegend=False,
+                hovertemplate=f'{g_col}={g}<br>{a_col}=%{{y:.3f}}<extra></extra>'),
+                row=1, col=2)
         
         fig.update_layout(template='plotly_white', height=500, width=1200,
                           title_text=f'Скрипичная диаграмма: {a_col} по {g_col}')
@@ -1696,16 +1754,25 @@ class DataAnalyzer:
             mode_v = data.mode().iloc[0] if not data.mode().empty else np.nan
             
             fig.add_vline(x=mean_v, line_dash='dash', line_color='red', 
-                          line_width=2, row=1, col=idx+1,
-                          annotation_text=f'Ср.={mean_v:.2f}', annotation_position='top')
+                          line_width=2, row=1, col=idx+1)
             fig.add_vline(x=med_v, line_dash='dot', line_color='green', 
-                          line_width=2, row=1, col=idx+1,
-                          annotation_text=f'Мед.={med_v:.2f}', annotation_position='top')
+                          line_width=2, row=1, col=idx+1)
             
             if not np.isnan(mode_v):
                 fig.add_vline(x=mode_v, line_dash='dashdot', line_color='orange', 
-                              line_width=2, row=1, col=idx+1,
-                              annotation_text=f'Мод.={mode_v:.2f}', annotation_position='bottom')
+                              line_width=2, row=1, col=idx+1)
+            
+            # Подписи статистик выносим в отдельный блок в правом верхнем углу,
+            # чтобы среднее, медиана и мода не накладывались друг на друга
+            mode_txt = f'<br><span style="color:orange">Mo={mode_v:.2f}</span>' if not np.isnan(mode_v) else ''
+            suffix = '' if idx == 0 else str(idx + 1)
+            fig.add_annotation(
+                x=1.0, y=0.98, xref=f'x{suffix} domain', yref=f'y{suffix} domain',
+                text=(f'<span style="color:red">μ={mean_v:.2f}</span>'
+                      f'<br><span style="color:green">M={med_v:.2f}</span>{mode_txt}'),
+                showarrow=False, xanchor='right', yanchor='top', align='left',
+                font=dict(size=11), bgcolor='rgba(255,255,255,0.85)',
+                bordercolor='#bbb', borderwidth=1, borderpad=4)
         
         fig.update_layout(title='Гистограммы с расширенной статистикой',
                           template='plotly_white', height=400, width=500*n,
@@ -1858,39 +1925,33 @@ class DataAnalyzer:
             if pd.isna(val): return 'N/A'
             return f'{val:.2f}{_marker(p)}'
         
-        # Текст: значения+маркеры только под диагональю, диагональ и выше — пусто
-        text_main = np.full((n, n), '', dtype=object)
-        text_faded = np.full((n, n), '', dtype=object)
-        z_main = np.full((n, n), np.nan)
-        z_faded = np.full((n, n), np.nan)
+        # Значимые ячейки окрашиваются, незначимые (p>=0.05) выглядят приглушённо
+        # (z=0 -> белый цвет матрицы), реальное r в подсказке приходит из customdata.
+        # Один heatmap на всю матрицу — чтобы подсказки всегда показывали настоящее r,
+        # а не "r=0.000" от перекрывающего слоя.
+        z = np.full((n, n), np.nan)
+        text = np.full((n, n), '', dtype=object)
+        cd = np.full((n, n), '', dtype=object)
         
         for i in range(n):
             for j in range(n):
-                if i > j:
-                    if p_vals[i, j] < 0.05:
-                        z_main[i, j] = corr_vals[i, j]
-                        text_main[i, j] = _fmt(corr_vals[i, j], p_vals[i, j])
-                    else:
-                        z_faded[i, j] = corr_vals[i, j]
-                        text_faded[i, j] = _fmt(corr_vals[i, j], p_vals[i, j])
+                if i == j:
+                    z[i, j] = 1.0
+                    cd[i, j] = '1.000'
+                elif i > j:
+                    r_val = corr_vals[i, j]
+                    text[i, j] = _fmt(r_val, p_vals[i, j])
+                    cd[i, j] = f'{r_val:.3f}'
+                    z[i, j] = r_val if p_vals[i, j] < 0.05 else 0.0
         
         fig = go.Figure(data=go.Heatmap(
-            z=z_main.tolist(), x=num_cols, y=num_cols,
+            z=z.tolist(), x=num_cols, y=num_cols,
             colorscale='RdBu_r', zmin=-1, zmax=1,
-            text=text_main.tolist(), texttemplate='%{text}', textfont={'size': 12},
+            text=text.tolist(), texttemplate='%{text}',
+            textfont={'size': 11},
+            customdata=cd.tolist(),
             showscale=True, colorbar=dict(title='Корреляция r'),
-            hovertemplate='%{x} vs %{y}<br>r=%{z:.3f}<extra></extra>'))
-        
-        # Полупрозрачный слой для незначимых (p≥0.05) ячеек под диагональю
-        if np.any(np.isfinite(z_faded)):
-            fig.add_trace(go.Heatmap(
-                z=z_faded.tolist(), x=num_cols, y=num_cols,
-                colorscale='RdBu_r', zmin=-1, zmax=1,
-                text=text_faded.tolist(), texttemplate='%{text}',
-                textfont={'size': 12, 'color': '#6c757d'}, showscale=False,
-                opacity=0.25,
-                hovertemplate='%{x} vs %{y}<br>r=%{z:.3f} (p≥0.05)<extra></extra>',
-                hoverinfo='skip'))
+            hovertemplate='%{x} vs %{y}<br>r=%{customdata}<extra></extra>'))
         
         fig.update_layout(
             title='Корреляционная матрица (*** p<0.001, ** p<0.01, * p<0.05, · — незначимо, p≥0.05)',
@@ -2065,8 +2126,8 @@ class DataAnalyzer:
         display(widgets.VBox([widgets.HTML('<h3>Комментарии к разделам отчёта</h3>')] + boxes))
 
     # ====================== ГЕНЕРАЦИЯ HTML-ОТЧЁТА ======================
-    def generate_html_report(self, df_clean=None, sections=None):
-        import json as _json
+    def generate_html_report(self, df_clean=None, sections=None, output_path=None):
+        """Тонкая обёртка над каноническим InteractiveReportBuilder."""
         if df_clean is None:
             df_clean = self._current_df
         if sections is None:
@@ -2078,255 +2139,789 @@ class DataAnalyzer:
             if txt:
                 comments_html += f'<div class="user-comment"><b>{sec}:</b> {txt}</div>\n'
 
-        plotly_figs = {}
-        g_col = self.params.get('group', '')
-        a_col = self.params.get('analysis', '')
-        multi = self.params.get('multi', [])
-        cat_multi = self.params.get('cat_multi', [])
-        num_cols = [c for c in multi if c in df_clean.columns
-                    and pd.api.types.is_numeric_dtype(df_clean[c])]
+        builder = InteractiveReportBuilder(
+            df_clean, self.params, self._analysis_results,
+            preprocessing_stats=self._preprocessing_stats, sections=sections)
+        builder.comments_html = comments_html
+        if output_path is None:
+            output_path = os.path.join(os.getcwd(), f'{Path(self.file_name).stem}_report.html')
+        builder.generate_html(Path(output_path))
+        print(f'HTML-отчёт сохранён: {output_path}')
+        return str(output_path)
 
+
+class InteractiveReportBuilder:
+    def __init__(self, df: Any, params: Dict[str, Any], analysis_results: Dict[str, Any],
+                 preprocessing_stats: Dict[str, Any] = None, sections: Optional[Dict[str, bool]] = None):
+        self.df = df
+        self.params = params
+        self.results = analysis_results
+        self.preprocessing_stats = preprocessing_stats or {}
+        self.figures: Dict[str, str] = {}
+        self.sections = sections
+        self.comments_html = ""
+        self.stat_css = '''
+        .stat-table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.95em; }
+        .stat-table th { background: #3498db; color: white; padding: 10px 12px; border: 1px solid #2980b9; text-align: left; cursor: pointer; user-select: none; }
+        .stat-table th:hover { background: #2980b9; }
+        .stat-table th::after { content: " ⇅"; font-size: 0.8em; opacity: 0.6; }
+        .stat-table th.sort-asc::after { content: " ▲"; opacity: 1; }
+        .stat-table th.sort-desc::after { content: " ▼"; opacity: 1; }
+        .stat-table td { padding: 8px 12px; border: 1px solid #d0d7de; }
+        .stat-table tr:nth-child(even) { background: #f8f9fa; }
+        .stat-table tr:hover { background: #eaf4fc; }
+        .interp-note { background:#eef6ff; border-left:4px solid #3498db; padding:12px 16px; margin:15px 0; border-radius:0 6px 6px 0; font-size:0.95em; }
+        .user-comment { background: #fffde7; border-left: 4px solid #fbc02d; padding: 12px 16px; margin: 15px 0; border-radius: 0 6px 6px 0; font-size: 0.95em; }
+        '''
+
+    def _fig_to_json(self, fig: Any) -> str:
+        return fig_to_json(fig)
+    def _safe_fig(self, func, *args, **kwargs):
         try:
-            import plotly.graph_objects as go
-            from plotly.subplots import make_subplots
-            import plotly.express as px
-            has_plotly = True
-        except ImportError:
-            has_plotly = False
+            fig = func(*args, **kwargs)
+            return fig
+        except Exception as e:
+            logger.error(f"Ошибка построения графика: {e}")
+            return None
 
-        if has_plotly and sections.get('plots', False):
-            colors = px.colors.qualitative.Set2
+    # ==================== ВИЗУАЛИЗАЦИЯ ====================
+    def build_plots(self):
+        import pandas as pd
+        import plotly.express as px
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        from scipy import stats as sp_stats
 
-            fig_methods = [
-                ('violin', self.plot_violin),
-                ('boxplot', self.plot_boxplot_with_significance),
-                ('histogram', self.plot_histograms),
-                ('pie', self.plot_pie_chart),
-                ('scatter', self.plot_scatter_with_regression),
-                ('interaction', self.plot_interaction_effect),
-                ('regression_diagnostics', self.plot_regression_diagnostics),
-            ]
-            for key, method in fig_methods:
-                try:
-                    fig = method()
-                    if fig is not None:
-                        plotly_figs[key] = fig
-                except Exception as e:
-                    logger.warning(f"Ошибка построения графика {key}: {e}")
+        df = self.df
+        group_col = self.params.get('group')
+        analysis_col = self.params.get('analysis')
+        multi = self.params.get('multi', [analysis_col])
+        cat_multi = self.params.get('cat_multi', [])
 
-            # Correlation matrix (inline — uses df_clean directly)
-            if len(num_cols) > 1:
-                try:
-                    corr = df_clean[num_cols].corr()
-                    n = len(num_cols)
-                    p_mat = [[0.0]*n for _ in range(n)]
-                    from scipy import stats as _sp_stats
-                    for i in range(n):
-                        for j in range(i+1, n):
-                            pair = df_clean[[num_cols[i], num_cols[j]]].dropna()
-                            _, p = _sp_stats.pearsonr(pair[num_cols[i]], pair[num_cols[j]])
-                            p_mat[i][j] = p; p_mat[j][i] = p
+        valid_multi = [c for c in multi if c in df.columns]
+        num_cols_in_df = [c for c in valid_multi if pd.api.types.is_numeric_dtype(df[c])]
 
-                    def _marker(p):
-                        if p < 0.001: return '***'
-                        if p < 0.01: return '**'
-                        if p < 0.05: return '*'
-                        return '·'
+        # 1. Скрипичная диаграмма + ящик + swarm/strip
+        fig = self._safe_fig(self._plot_violin, df, analysis_col, group_col)
+        if fig:
+            self.figures['violin'] = self._fig_to_json(fig)
 
-                    def _fmt(val, p):
-                        if pd.isna(val): return 'N/A'
-                        return f'{val:.2f}{_marker(p)}'
+        # 2. Ящики с усами со скобками значимости
+        fig = self._safe_fig(self._boxplot_with_significance, df, group_col, analysis_col)
+        if fig:
+            self.figures['boxplot'] = self._fig_to_json(fig)
 
-                    text_main = np.full((n, n), '', dtype=object)
-                    text_faded = np.full((n, n), '', dtype=object)
-                    z_main = np.full((n, n), np.nan)
-                    z_faded = np.full((n, n), np.nan)
+        # 3. Гистограммы с mean/median/mode
+        fig = self._safe_fig(self._histograms_with_stats, df, num_cols_in_df, group_col)
+        if fig:
+            self.figures['histogram'] = self._fig_to_json(fig)
 
-                    for i in range(n):
-                        for j in range(n):
-                            if i > j:
-                                if p_mat[i][j] < 0.05:
-                                    z_main[i, j] = corr.iloc[i, j]
-                                    text_main[i, j] = _fmt(corr.iloc[i, j], p_mat[i][j])
-                                else:
-                                    z_faded[i, j] = corr.iloc[i, j]
-                                    text_faded[i, j] = _fmt(corr.iloc[i, j], p_mat[i][j])
+        # 4. Круговые диаграммы
+        fig = self._safe_fig(self._pie_charts, df, group_col, cat_multi)
+        if fig:
+            self.figures['pie'] = self._fig_to_json(fig)
 
-                    fig = go.Figure(data=go.Heatmap(
-                        z=z_main.tolist(), x=num_cols, y=num_cols,
-                        colorscale='RdBu_r', zmin=-1, zmax=1,
-                        text=text_main.tolist(), texttemplate='%{text}',
-                        textfont={'size': 12}, showscale=True,
-                        colorbar=dict(title='Корреляция r'),
-                        hovertemplate='%{x} vs %{y}<br>r=%{z:.3f}<extra></extra>'))
+        # 5. Скаттерограмма с регрессией
+        if len(num_cols_in_df) > 1:
+            scatter_x = num_cols_in_df[0] if num_cols_in_df[0] != analysis_col else num_cols_in_df[1]
+            fig = self._safe_fig(self._plot_scatter_regression, df, scatter_x, analysis_col, group_col)
+            if fig:
+                self.figures['scatter'] = self._fig_to_json(fig)
 
-                    if np.any(np.isfinite(z_faded)):
-                        fig.add_trace(go.Heatmap(
-                            z=z_faded.tolist(), x=num_cols, y=num_cols,
-                            colorscale='RdBu_r', zmin=-1, zmax=1,
-                            text=text_faded.tolist(), texttemplate='%{text}',
-                            textfont={'size': 12, 'color': '#6c757d'}, showscale=False,
-                            opacity=0.25,
-                            hovertemplate='%{x} vs %{y}<br>r=%{z:.3f} (p≥0.05)<extra></extra>',
-                            hoverinfo='skip'))
+        # 6. PairGrid
+        if len(num_cols_in_df) > 2:
+            dims = num_cols_in_df[:6]
+            fig = self._safe_fig(self._plot_pairgrid, df, dims, group_col)
+            if fig:
+                self.figures['pairgrid'] = self._fig_to_json(fig)
 
-                    fig.update_layout(
-                        title='Корреляционная матрица (*** p<0.001, ** p<0.01, * p<0.05, · — незначимо, p≥0.05)',
-                        template='plotly_white', height=550, width=650)
-                    # Основа матрицы: строка з-индекса 0 сверху, значения ниже главной диагонали
-                    fig.update_yaxes(autorange='reversed')
-                    plotly_figs['correlation'] = fig
-                except Exception as e:
-                    logger.warning(f"Ошибка построения корреляционной матрицы: {e}")
+        # 7. Корреляционная матрица с полупрозрачными незначимыми
+        if len(num_cols_in_df) > 1:
+            fig = self._safe_fig(self._correlation_matrix_plotly, df, num_cols_in_df)
+            if fig:
+                self.figures['correlation'] = self._fig_to_json(fig)
 
-            # RF importance
-            rf_data = self._analysis_results.get('rf_importance_data', {})
-            if rf_data:
-                features = rf_data['features'][::-1]
-                values = rf_data['values'][::-1]
-                fig = go.Figure(go.Bar(x=values, y=features, orientation='h', marker_color='#3498db',
-                                       text=[f'{v:.3f}' for v in values], textposition='outside'))
-                fig.update_layout(title='Важность признаков (Random Forest)',
-                                  xaxis_title='Важность', template='plotly_white',
-                                  height=max(300, len(features)*40))
-                plotly_figs['rf_importance'] = fig
+        # 8. График взаимодействия
+        fig = self._safe_fig(self._interaction_plot, df, group_col, analysis_col, cat_multi)
+        if fig:
+            self.figures['interaction'] = self._fig_to_json(fig)
 
-            # PCA
-            pca_data = self._analysis_results.get('pca', {})
-            if pca_data.get('explained_variance'):
-                ev = pca_data['explained_variance']
-                cum = pca_data['cumulative_variance']
-                labels = [f'PC{i+1}' for i in range(len(ev))]
-                fig = make_subplots(rows=1, cols=1)
-                fig.add_trace(go.Bar(x=labels, y=[v*100 for v in ev], name='Доля дисперсии',
-                                     marker_color='#3498db', text=[f'{v*100:.1f}%' for v in ev],
-                                     textposition='outside'))
-                fig.add_trace(go.Scatter(x=labels, y=[v*100 for v in cum], mode='lines+markers',
-                                         name='Кумулятивная', marker=dict(color='#e74c3c', size=8)))
-                fig.add_hline(y=95, line_dash='dash', line_color='#27ae60', annotation_text='95%')
-                fig.update_layout(title='Метод главных компонент (PCA)', template='plotly_white', height=400)
-                plotly_figs['pca'] = fig
+        # 9. Диагностика регрессии
+        lr_res = self.results.get('linear_regression', {})
+        if lr_res.get('y_test') is not None:
+            fig = self._safe_fig(self._regression_diagnostics, lr_res)
+            if fig:
+                self.figures['regression_diagnostics'] = self._fig_to_json(fig)
 
-            # Elbow
-            elbow = self._analysis_results.get('elbow', {})
-            if elbow.get('inertias'):
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=elbow['k_range'], y=elbow['inertias'],
-                                         mode='lines+markers', marker=dict(size=10, color='#3498db')))
-                fig.add_vline(x=elbow.get('optimal_k', 2), line_dash='dash', line_color='#e74c3c',
-                              annotation_text=f"Optimal k={elbow.get('optimal_k', 2)}")
-                fig.update_layout(title='Метод каменистой осыпи (Elbow)', xaxis_title='Число кластеров k',
-                                  yaxis_title='Инерция (WCSS)', template='plotly_white', height=400)
-                plotly_figs['elbow'] = fig
+        # 10. Важность признаков (RF)
+        rf_data = self.results.get('rf_importance_data', {})
+        if rf_data:
+            fig = self._safe_fig(self._feature_importance_plot, rf_data)
+            if fig:
+                self.figures['rf_importance'] = self._fig_to_json(fig)
 
-            # K-Means scatter (PCA 2D)
-            kmeans = self._analysis_results.get('kmeans', {})
-            if kmeans.get('labels') and len(num_cols) >= 2:
-                from sklearn.decomposition import PCA as _PCA
-                from sklearn.preprocessing import StandardScaler as _SS
-                X_pca_data = df_clean[num_cols].dropna()
-                labels_arr = np.array(kmeans['labels'])
-                if len(labels_arr) == len(X_pca_data):
-                    pca2 = _PCA(n_components=2, random_state=42)
-                    X_2d = pca2.fit_transform(_SS().fit_transform(X_pca_data))
-                    fig = px.scatter(x=X_2d[:, 0], y=X_2d[:, 1], color=labels_arr.astype(str),
-                                     title=f'K-Means кластеризация (k={kmeans["k"]})',
-                                     labels={'x': 'PC1', 'y': 'PC2', 'color': 'Кластер'},
-                                     color_discrete_sequence=colors)
-                    fig.update_layout(template='plotly_white', height=500)
-                    plotly_figs['kmeans_scatter'] = fig
+        # 11. PCA
+        pca_data = self.results.get('pca', {})
+        if pca_data.get('explained_variance'):
+            fig = self._safe_fig(self._pca_plot, pca_data)
+            if fig:
+                self.figures['pca'] = self._fig_to_json(fig)
 
-            # Confusion matrix
-            ml = self._analysis_results.get('ml_benchmark', {})
-            if ml.get('best_y_test') is not None:
-                from sklearn.metrics import confusion_matrix as _cm
-                y_true = ml['best_y_test']; y_pred_ml = ml['best_y_pred']
-                cn = ml.get('best_class_names', [])
-                if cn is None or len(cn) == 0:
-                    cn = [str(i) for i in range(len(np.unique(y_true)))]
-                cm = _cm(y_true, y_pred_ml)
-                fig = go.Figure(data=go.Heatmap(z=cm, x=cn, y=cn, colorscale='Blues',
-                                                text=cm, texttemplate='%{text}', textfont={'size': 14}))
-                fig.update_layout(title=f'Матрица ошибок: {ml.get("best_model", "")}',
-                                  xaxis_title='Предсказанные', yaxis_title='Истинные',
-                                  template='plotly_white', height=400)
-                plotly_figs['confusion_matrix'] = fig
+        # 12. Elbow
+        elbow = self.results.get('elbow', {})
+        if elbow.get('inertias'):
+            fig = self._safe_fig(self._elbow_plot, elbow)
+            if fig:
+                self.figures['elbow'] = self._fig_to_json(fig)
 
-            # ROC curve
-            if ml.get('best_y_proba') is not None:
-                from sklearn.metrics import roc_curve as _roc, roc_auc_score as _roc_auc
-                y_test_roc = ml['best_y_test']; y_proba = ml['best_y_proba']
-                cn_roc = ml.get('best_class_names', [])
-                if cn_roc is None or len(cn_roc) == 0:
-                    cn_roc = [str(i) for i in range(len(np.unique(y_test_roc)))]
-                nc = len(cn_roc)
-                fig = go.Figure()
-                if nc == 2:
-                    fpr, tpr, _ = _roc(y_test_roc, y_proba[:, 1])
-                    auc = ml.get('best_auc_mean', 0)
-                    fig.add_trace(go.Scatter(x=fpr, y=tpr, name=f'AUC={auc:.3f}',
-                                             line=dict(width=2.5, color=colors[0])))
-                else:
-                    for i in range(nc):
-                        fpr, tpr, _ = _roc((y_test_roc == i).astype(int), y_proba[:, i])
-                        auc_i = _roc_auc((y_test_roc == i).astype(int), y_proba[:, i])
-                        fig.add_trace(go.Scatter(x=fpr, y=tpr, name=f'{cn_roc[i]} (AUC={auc_i:.3f})',
-                                                 line=dict(width=2.5, color=colors[i % len(colors)])))
-                fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines',
-                                         line=dict(dash='dash', color='gray', width=1.5), showlegend=False))
-                fig.update_layout(title=f'ROC-кривая: {ml.get("best_model", "")}',
-                                  xaxis_title='FPR', yaxis_title='TPR',
-                                  template='plotly_white', height=400)
-                plotly_figs['roc'] = fig
+        # 12. K-Means scatter
+        kmeans = self.results.get('kmeans', {})
+        if kmeans.get('labels') is not None and len(num_cols_in_df) >= 2:
+            fig = self._safe_fig(self._kmeans_scatter, df, num_cols_in_df, kmeans)
+            if fig:
+                self.figures['kmeans_scatter'] = self._fig_to_json(fig)
 
-        # --- Сборка HTML ---
+        # 13. Профили кластеров (динамика + тепловая карта)
+        if kmeans.get('cluster_means'):
+            fig = self._safe_fig(self._cluster_dynamics, kmeans)
+            if fig:
+                self.figures['cluster_dynamics'] = self._fig_to_json(fig)
+
+        # 14. Boxplot признаков по кластерам
+        if kmeans.get('labels') is not None and num_cols_in_df:
+            fig = self._safe_fig(self._cluster_boxplots, df, num_cols_in_df, kmeans)
+            if fig:
+                self.figures['cluster_boxplots'] = self._fig_to_json(fig)
+
+        # 15. Матрица ошибок
+        ml = self.results.get('ml_benchmark', {})
+        if ml.get('best_y_test') is not None:
+            fig = self._safe_fig(self._confusion_matrix, ml)
+            if fig:
+                self.figures['confusion_matrix'] = self._fig_to_json(fig)
+
+        # 16. ROC-кривая
+        if ml.get('best_y_proba') is not None:
+            fig = self._safe_fig(self._roc_curve, ml)
+            if fig:
+                self.figures['roc_curve'] = self._fig_to_json(fig)
+
+    def _plot_violin(self, df, analysis_col, group_col):
+        import plotly.express as px
+        fig = px.violin(df, y=analysis_col, x=group_col, box=True,
+                        points="all", color=group_col,
+                        title=f"Скрипичная диаграмма: {analysis_col} по {group_col}",
+                        color_discrete_sequence=px.colors.qualitative.Set2)
+        fig.update_layout(template="plotly_white", showlegend=False)
+        return fig
+
+    def _plot_scatter_regression(self, df, x_col, y_col, group_col):
+        import plotly.express as px
+        import numpy as np
+        from scipy import stats as sp_stats
+        fig = px.scatter(df, x=x_col, y=y_col, color=group_col,
+                         trendline="ols",
+                         title=f"Scatter + OLS: {x_col} vs {y_col}",
+                         color_discrete_sequence=px.colors.qualitative.Set2)
+        slope, intercept, r, p, se = sp_stats.linregress(df[x_col].dropna(), df[y_col].dropna())
+        angle = np.degrees(np.arctan(slope))
+        fig.update_layout(template="plotly_white")
+        fig.add_annotation(
+            text=(f"Угол наклона: {angle:.1f}° | Наклон (β₁): {slope:.4f}<br>"
+                  f"r = {r:.3f} | R² = {r**2:.3f} | p = {p:.2e}"),
+            xref="paper", yref="paper", x=0.02, y=0.98,
+            showarrow=False, font=dict(size=11),
+            bgcolor="rgba(255,255,255,0.85)", bordercolor="#ccc", borderwidth=1)
+        return fig
+
+    def _plot_pairgrid(self, df, dims, group_col):
+        import plotly.express as px
+        fig = px.scatter_matrix(df, dimensions=dims, color=group_col,
+                                title="Попарные распределения",
+                                height=900,
+                                color_discrete_sequence=px.colors.qualitative.Set2)
+        fig.update_traces(diagonal_visible=True, showupperhalf=False)
+        fig.update_layout(template="plotly_white")
+        return fig
+
+    def _boxplot_with_significance(self, df, g_col, a_col):
+        import plotly.express as px
+        import plotly.graph_objects as go
+        from itertools import combinations
+        from scipy import stats as sp_stats
+
+        groups = sorted(df[g_col].unique(), key=str)
+        fig = go.Figure()
+        for g in groups:
+            vals = df[df[g_col] == g][a_col].dropna()
+            fig.add_trace(go.Box(y=vals, name=str(g), boxpoints='outliers',
+                                 marker_color=px.colors.qualitative.Set2[groups.index(g) % len(groups)]))
+
+        if len(groups) >= 2:
+            y_max = df[a_col].max()
+            y_range = df[a_col].max() - df[a_col].min()
+            if y_range == 0: y_range = abs(y_max) if y_max != 0 else 1.0
+            bracket_y = y_max + y_range * 0.05
+            for i, j in combinations(range(len(groups)), 2):
+                g1_vals = df[df[g_col] == groups[i]][a_col].dropna().values
+                g2_vals = df[df[g_col] == groups[j]][a_col].dropna().values
+                if len(g1_vals) < 3 or len(g2_vals) < 3: continue
+                _, p_val = sp_stats.mannwhitneyu(g1_vals, g2_vals, alternative='two-sided')
+                if p_val < 0.001: sig = '***'
+                elif p_val < 0.01: sig = '**'
+                elif p_val < 0.05: sig = '*'
+                else: continue
+                fig.add_shape(type="line", x0=i, x1=j, y0=bracket_y, y1=bracket_y,
+                              line=dict(color="#2c3e50", width=2))
+                fig.add_annotation(x=(i+j)/2, y=bracket_y + y_range*0.02, text=sig,
+                                   showarrow=False, font=dict(size=14, color="#e74c3c", family="Arial Black"))
+                bracket_y += y_range * 0.08
+
+        fig.update_layout(title=f'Ящики с усами: {a_col}', yaxis_title=a_col, xaxis_title=g_col,
+                          template="plotly_white", height=500)
+        return fig
+
+    def _histograms_with_stats(self, df, num_cols, group_col):
+        import plotly.express as px
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        import numpy as np
+
+        cols = num_cols[:6]
+        n = len(cols)
+        if n == 0: return None
+        fig = make_subplots(rows=1, cols=n, subplot_titles=cols,
+                            horizontal_spacing=0.04)
+        colors = px.colors.qualitative.Set2
+        stat_traces = {'mean': [], 'median': [], 'mode': []}
+        for idx, col in enumerate(cols):
+            data = df[col].dropna()
+            if data.empty: continue
+            mean_v = data.mean()
+            med_v = data.median()
+            mode_v = data.mode().iloc[0] if not data.mode().empty else np.nan
+            fig.add_trace(go.Histogram(x=data, name=col, opacity=0.75,
+                                       marker_color=colors[idx % len(colors)],
+                                       showlegend=False), row=1, col=idx+1)
+            fig.add_vline(x=mean_v, line_dash="dash", line_color="red", row=1, col=idx+1)
+            fig.add_vline(x=med_v, line_dash="dot", line_color="green", row=1, col=idx+1)
+            if not np.isnan(mode_v):
+                fig.add_vline(x=mode_v, line_dash="dashdot", line_color="orange", row=1, col=idx+1)
+            if idx == 0:
+                stat_traces['mean'].append(go.Scatter(x=[None], y=[None], mode='lines',
+                    line=dict(color='red', dash='dash', width=2), name='Среднее (μ)'))
+                stat_traces['median'].append(go.Scatter(x=[None], y=[None], mode='lines',
+                    line=dict(color='green', dash='dot', width=2), name='Медиана (M)'))
+                stat_traces['mode'].append(go.Scatter(x=[None], y=[None], mode='lines',
+                    line=dict(color='orange', dash='dashdot', width=2), name='Мода (Mo)'))
+            fig.add_annotation(x=mean_v, y=0, text=f'{mean_v:.2f}',
+                showarrow=False, font=dict(size=9, color='red'),
+                xref=f'x{idx+1}' if idx > 0 else 'x', yref='y',
+                yshift=10, row=1, col=idx+1)
+            fig.add_annotation(x=med_v, y=0, text=f'{med_v:.2f}',
+                showarrow=False, font=dict(size=9, color='green'),
+                xref=f'x{idx+1}' if idx > 0 else 'x', yref='y',
+                yshift=-10, row=1, col=idx+1)
+
+        fig.add_traces(stat_traces['mean'] + stat_traces['median'] + stat_traces['mode'])
+        fig.update_layout(title="Гистограммы с статистиками", template="plotly_white",
+                          height=450,
+                          legend=dict(orientation='h', yanchor='bottom', y=-0.25,
+                                      xanchor='center', x=0.5, font=dict(size=11)))
+        fig.update_annotations(font_size=12)
+        return fig
+
+    def _pie_charts(self, df, group_col, cat_multi):
+        import plotly.express as px
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+
+        cats = [group_col]
+        for c in cat_multi:
+            if c in df.columns and c not in cats: cats.append(c)
+        cats = cats[:4]
+        n = len(cats)
+        if n == 0: return None
+        fig = make_subplots(rows=1, cols=n, specs=[[{'type': 'pie'}]*n],
+                            subplot_titles=cats)
+        for idx, col in enumerate(cats):
+            counts = df[col].value_counts()
+            fig.add_trace(go.Pie(labels=counts.index.astype(str), values=counts.values,
+                                  hole=0.3, textinfo='percent',
+                                  marker_colors=px.colors.qualitative.Set2[:len(counts)]), row=1, col=idx+1)
+        fig.update_layout(title="Круговые диаграммы", height=400, template="plotly_white")
+        return fig
+
+    def _correlation_matrix_plotly(self, df, num_cols):
+        import plotly.graph_objects as go
+        from scipy import stats as sp_stats
+        import pandas as pd
+        import numpy as np
+
+        corr = df[num_cols].corr(numeric_only=True)
+        n = len(num_cols)
+        p_vals = np.ones((n, n))
+        for i, c1 in enumerate(num_cols):
+            for j, c2 in enumerate(num_cols):
+                if i < j:
+                    pair = df[[c1, c2]].dropna()
+                    _, p = sp_stats.pearsonr(pair[c1], pair[c2])
+                    p_vals[i, j] = p
+                    p_vals[j, i] = p
+
+        corr_vals = corr.values
+
+        def _marker(p):
+            if p < 0.001:
+                return '***'
+            if p < 0.01:
+                return '**'
+            if p < 0.05:
+                return '*'
+            return '·'
+
+        def _fmt(val, p, marker=True):
+            if pd.isna(val):
+                return 'N/A'
+            m = _marker(p) if marker else ''
+            return f'{val:.2f}{m}'
+
+        # Значимые ячейки окрашиваются, незначимые (p>=0.05) выглядят приглушённо
+        # (z=0 -> белый цвет матрицы), реальное r в подсказке приходит из customdata.
+        # Один heatmap на всю матрицу — чтобы подсказки всегда показывали настоящее r,
+        # а не "r=0.000" от перекрывающего слоя.
+        z = np.full((n, n), np.nan)
+        text = np.full((n, n), '', dtype=object)
+        cd = np.full((n, n), '', dtype=object)
+
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    # Диагональ: корреляция признака с самим собой = 1
+                    z[i, j] = 1.0
+                    cd[i, j] = '1.000'
+                elif i > j:
+                    r_val = corr_vals[i, j]
+                    text[i, j] = _fmt(r_val, p_vals[i, j])
+                    cd[i, j] = f'{r_val:.3f}'
+                    z[i, j] = r_val if p_vals[i, j] < 0.05 else 0.0
+
+        heat = go.Heatmap(
+            z=z.tolist(), x=num_cols, y=num_cols,
+            colorscale='RdBu_r', zmin=-1, zmax=1,
+            text=text.tolist(), texttemplate='%{text}',
+            textfont={'size': 11},
+            customdata=cd.tolist(),
+            showscale=True,
+            colorbar=dict(title='Корреляция r'),
+            hovertemplate='%{x} vs %{y}<br>r=%{customdata}<extra></extra>')
+
+        fig = go.Figure(data=[heat])
+
+        fig.update_layout(
+            title='Корреляционная матрица (*** p<0.001, ** p<0.01, * p<0.05, · — незначимо, p≥0.05)',
+            template='plotly_white', height=600, width=700)
+        # Основа матрицы: строка з-индекса 0 сверху (как в таблицах), значения ниже главной диагонали
+        fig.update_yaxes(autorange='reversed')
+        return fig
+
+    def _interaction_plot(self, df, group_col, analysis_col, cat_multi):
+        import plotly.express as px
+        import plotly.graph_objects as go
+        import pandas as pd
+        import numpy as np
+
+        second_factor = None
+        for c in cat_multi:
+            if c in df.columns and c != group_col:
+                second_factor = c
+                break
+        if second_factor is None: return None
+
+        n_g = df[group_col].nunique()
+        n_s = df[second_factor].nunique()
+        if n_g >= n_s:
+            x_col, hue_col = group_col, second_factor
+        else:
+            x_col, hue_col = second_factor, group_col
+
+        grouped = df.groupby([x_col, hue_col])[analysis_col].agg(['median', 'count'])
+        grouped.columns = ['median', 'count']
+        grouped['q1'] = df.groupby([x_col, hue_col])[analysis_col].quantile(0.25)
+        grouped['q3'] = df.groupby([x_col, hue_col])[analysis_col].quantile(0.75)
+        grouped = grouped.reset_index()
+
+        fig = go.Figure()
+        colors = px.colors.qualitative.Set2
+        hues = sorted(grouped[hue_col].unique(), key=str)
+        for idx, hue_val in enumerate(hues):
+            sub = grouped[grouped[hue_col] == hue_val]
+            x_vals = sub[x_col].astype(str).tolist()
+            medians = sub['median'].tolist()
+            q1s = sub['q1'].tolist()
+            q3s = sub['q3'].tolist()
+            color = colors[idx % len(colors)]
+            fig.add_trace(go.Scatter(x=x_vals, y=medians, mode='lines+markers',
+                                      name=f'{hue_col}={hue_val}',
+                                      line=dict(color=color, width=2.5),
+                                      marker=dict(size=8)))
+            fig.add_trace(go.Scatter(
+                x=x_vals + x_vals[::-1], y=q3s + q1s[::-1],
+                fill='toself', fillcolor=color.replace(')', ',0.15)').replace('rgb', 'rgba') if 'rgb' in color else color + '22',
+                line=dict(color='rgba(0,0,0,0)'), showlegend=False, hoverinfo='skip'))
+        fig.update_layout(title=f"Взаимодействие: {x_col} × {hue_col} на {analysis_col}",
+                          xaxis_title=x_col, yaxis_title=analysis_col,
+                          template="plotly_white", height=500,
+                          annotations=[dict(
+                              text="Линия — медиана; область — межквартильный размах (Q1–Q3)",
+                              xref="paper", yref="paper", x=0.5, y=-0.12,
+                              showarrow=False, font=dict(size=11, color="gray"))])
+        return fig
+
+    def _regression_diagnostics(self, lr_res):
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        from scipy import stats as sp_stats
+
+        y_test = lr_res['y_test']
+        y_pred = lr_res['y_pred']
+        residuals = y_test - y_pred
+
+        fig = make_subplots(rows=1, cols=2, subplot_titles=["Остатки vs Предсказанные", "Q-Q plot остатков"])
+        fig.add_trace(go.Scatter(x=y_pred, y=residuals, mode='markers',
+                                  marker=dict(color='#3498db', opacity=0.6)),
+                       row=1, col=1)
+        fig.add_hline(y=0, line_dash="dash", line_color="#e74c3c", row=1, col=1)
+
+        sorted_res = np.sort(residuals)
+        norm_quantiles = sp_stats.norm.ppf(np.linspace(0.01, 0.99, len(sorted_res)))
+        fig.add_trace(go.Scatter(x=norm_quantiles, y=sorted_res, mode='markers',
+                                  marker=dict(color='#3498db', opacity=0.6), name='Остатки'),
+                       row=1, col=2)
+        lim = max(abs(norm_quantiles.min()), abs(norm_quantiles.max()), abs(sorted_res.min()), abs(sorted_res.max()))
+        fig.add_trace(go.Scatter(x=[-lim, lim], y=[-lim, lim], mode='lines',
+                                  line=dict(color='#e74c3c', dash='dash'), name='Идеал'),
+                       row=1, col=2)
+
+        fig.update_xaxes(title_text="Предсказанные", row=1, col=1)
+        fig.update_yaxes(title_text="Остатки", row=1, col=1)
+        fig.update_xaxes(title_text="Теоретические квантили", row=1, col=2)
+        fig.update_yaxes(title_text="Выборочные квантили", row=1, col=2)
+        fig.update_layout(title="Диагностика регрессии", template="plotly_white", height=450, showlegend=False)
+        return fig
+
+    def _feature_importance_plot(self, rf_data):
+        import plotly.graph_objects as go
+
+        features = rf_data['features'][::-1]
+        values = rf_data['values'][::-1]
+        fig = go.Figure(go.Bar(x=values, y=features, orientation='h',
+                                marker_color='#3498db', text=[f'{v:.3f}' for v in values],
+                                textposition='outside'))
+        fig.update_layout(title="Важность признаков (Random Forest)", xaxis_title="Важность",
+                          template="plotly_white", height=max(300, len(features)*40))
+        return fig
+
+    def _pca_plot(self, pca_data):
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        import numpy as np
+
+        ev = pca_data['explained_variance']
+        cum = pca_data['cumulative_variance']
+        loadings = pca_data.get('loadings', {})
+        labels = [f'PC{i+1}' for i in range(len(ev))]
+
+        has_loadings = bool(loadings)
+        if has_loadings:
+            fig = make_subplots(rows=1, cols=2,
+                                subplot_titles=["Объяснённая и кумулятивная дисперсия", "Нагрузки (Loadings)"],
+                                column_widths=[0.5, 0.5])
+        else:
+            fig = make_subplots(rows=1, cols=1,
+                                subplot_titles=["Объяснённая и кумулятивная дисперсия"])
+
+        fig.add_trace(go.Bar(x=labels, y=[v*100 for v in ev], name='Доля дисперсии',
+                              marker_color='#3498db', text=[f'{v*100:.1f}%' for v in ev],
+                              textposition='outside'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=labels, y=[v*100 for v in cum], mode='lines+markers',
+                                  name='Кумулятивная', marker=dict(color='#e74c3c', size=8),
+                                  line=dict(color='#e74c3c', width=2)), row=1, col=1)
+        fig.add_hline(y=95, line_dash="dash", line_color="#27ae60",
+                      annotation_text="95%", row=1, col=1)
+
+        if has_loadings:
+            features = list(loadings.keys())
+            pcs = [k for k in next(iter(loadings.values())).keys()]
+            z = [[loadings[f].get(pc, 0) for pc in pcs] for f in features]
+            fig.add_trace(go.Heatmap(z=z, x=pcs, y=features,
+                                      colorscale='RdBu_r', zmin=-1, zmax=1,
+                                      text=[[f'{v:.2f}' for v in row] for row in z],
+                                      texttemplate="%{text}", textfont={"size": 10},
+                                      showscale=True, name='Loadings',
+                                      colorbar=dict(title='Нагрузка', thickness=12,
+                                                    len=0.5, y=0.5)), row=1, col=2)
+
+        fig.update_layout(title="Метод главных компонент (PCA)", template="plotly_white",
+                          height=max(400, 100 + len(labels)*30),
+                          legend=dict(orientation='h', yanchor='bottom', y=-0.2, xanchor='center', x=0.5))
+        fig.update_yaxes(title_text="%", row=1, col=1)
+        if has_loadings:
+            fig.update_xaxes(title_text="Компонента", row=1, col=2)
+            fig.update_yaxes(title_text="Признак", row=1, col=2)
+            fig.add_annotation(
+                text='Красный — положительная нагрузка, синий — отрицательная',
+                xref='paper', yref='paper', x=0.73, y=-0.15,
+                showarrow=False, font=dict(size=11, color='gray'))
+        return fig
+
+    def _elbow_plot(self, elbow):
+        import plotly.graph_objects as go
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=elbow['k_range'], y=elbow['inertias'],
+                                  mode='lines+markers', marker=dict(size=10, color='#3498db')))
+        optimal_k = elbow.get('optimal_k', 2)
+        fig.add_vline(x=optimal_k, line_dash="dash", line_color="#e74c3c",
+                      annotation_text=f"Optimal k={optimal_k}")
+        fig.update_layout(title="Метод каменистой осыпи (Elbow)", xaxis_title="Число кластеров k",
+                          yaxis_title="Инерция (WCSS)", template="plotly_white", height=450)
+        return fig
+
+    def _kmeans_scatter(self, df, num_cols, kmeans):
+        import plotly.express as px
+        import plotly.graph_objects as go
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+        import numpy as np
+
+        X = df[num_cols].dropna()
+        labels = np.array(kmeans['labels'])
+        if len(labels) != len(X): return None
+        pca = PCA(n_components=2, random_state=42)
+        X_2d = pca.fit_transform(StandardScaler().fit_transform(X))
+
+        fig = px.scatter(x=X_2d[:, 0], y=X_2d[:, 1], color=labels.astype(str),
+                         title=f"K-Means кластеризация (k={kmeans['k']})",
+                         labels={'x': 'PC1', 'y': 'PC2', 'color': 'Кластер'},
+                         color_discrete_sequence=px.colors.qualitative.Set2)
+        fig.update_layout(template="plotly_white", height=550)
+        return fig
+
+    def _cluster_dynamics(self, kmeans):
+        import plotly.express as px
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+
+        features = kmeans['features']
+        means = kmeans['cluster_means']
+        q1_data = kmeans.get('cluster_q1', {})
+        q3_data = kmeans.get('cluster_q3', {})
+        clusters = list(means.keys())
+
+        fig = make_subplots(rows=1, cols=2,
+                            subplot_titles=["Профили кластеров (медиана + IQR)", "Тепловая карта средних"],
+                            column_widths=[0.6, 0.4])
+
+        colors = px.colors.qualitative.Set2
+        for i, cl in enumerate(clusters):
+            vals = [means[cl].get(f, 0) for f in features]
+            color = colors[i % len(colors)]
+            fig.add_trace(go.Scatter(x=features, y=vals, mode='lines+markers',
+                                      name=f'Кластер {cl}',
+                                      line=dict(width=2.5, color=color),
+                                      marker=dict(size=8, color=color)),
+                           row=1, col=1)
+            if cl in q1_data and cl in q3_data:
+                q1_vals = [q1_data[cl].get(f, 0) for f in features]
+                q3_vals = [q3_data[cl].get(f, 0) for f in features]
+                fig.add_trace(go.Scatter(
+                    x=features + features[::-1], y=q3_vals + q1_vals[::-1],
+                    fill='toself', fillcolor=color.replace(')', ',0.12)').replace('rgb', 'rgba') if 'rgb' in color else color + '1e',
+                    line=dict(color='rgba(0,0,0,0)'), showlegend=False, hoverinfo='skip'),
+                    row=1, col=1)
+
+        heat_z = [[means[cl].get(f, 0) for cl in clusters] for f in features]
+        heat_text = [[f'{means[cl].get(f, 0):.2f}' for cl in clusters] for f in features]
+        fig.add_trace(go.Heatmap(z=heat_z, x=[f'Кластер {c}' for c in clusters], y=features,
+                                  colorscale='YlOrRd', showscale=True,
+                                  text=heat_text, texttemplate="%{text}",
+                                  textfont={"size": 11}),
+                       row=1, col=2)
+
+        fig.update_layout(title="Профили кластеров", template="plotly_white", height=500)
+        fig.add_annotation(
+            text="Линия — среднее; область — межквартильный размах (Q1–Q3)",
+            xref="paper", yref="paper", x=0.3, y=-0.12,
+            showarrow=False, font=dict(size=11, color="gray"))
+        return fig
+
+    def _cluster_boxplots(self, df, num_cols, kmeans):
+        import plotly.express as px
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+
+        labels = kmeans['labels']
+        df_plot = df[num_cols].copy()
+        df_plot['Кластер'] = [str(l) for l in labels]
+
+        fig = make_subplots(rows=1, cols=min(len(num_cols), 4),
+                            subplot_titles=num_cols[:4])
+        for idx, col in enumerate(num_cols[:4]):
+            for cl in sorted(df_plot['Кластер'].unique()):
+                vals = df_plot[df_plot['Кластер'] == cl][col].dropna()
+                fig.add_trace(go.Box(y=vals, name=f'Кластер {cl}', showlegend=(idx == 0)),
+                               row=1, col=idx+1)
+        fig.update_layout(title="Распределение признаков по кластерам",
+                          template="plotly_white", height=400)
+        return fig
+
+    def _confusion_matrix(self, ml):
+        import plotly.express as px
+        import plotly.graph_objects as go
+        from sklearn.metrics import confusion_matrix
+        import numpy as np
+
+        y_true = ml['best_y_test']
+        y_pred = ml['best_y_pred']
+        class_names = ml.get('best_class_names', [])
+        if class_names is None or len(class_names) == 0:
+            class_names = [str(i) for i in range(len(np.unique(y_true)))]
+        cm = confusion_matrix(y_true, y_pred)
+
+        fig = go.Figure(data=go.Heatmap(z=cm, x=class_names, y=class_names,
+                                         colorscale='Blues', text=cm, texttemplate="%{text}",
+                                         textfont={"size": 14}))
+        fig.update_layout(title=f"Матрица ошибок: {ml.get('best_model', '')}",
+                          xaxis_title="Предсказанные", yaxis_title="Истинные",
+                          template="plotly_white", height=450)
+        return fig
+
+    def _roc_curve(self, ml):
+        import plotly.express as px
+        import plotly.graph_objects as go
+        from sklearn.metrics import roc_curve, roc_auc_score
+        import numpy as np
+
+        y_test = ml['best_y_test']
+        y_proba = ml['best_y_proba']
+        class_names = ml.get('best_class_names', [])
+        if class_names is None or (hasattr(class_names, '__len__') and len(class_names) == 0):
+            class_names = [str(i) for i in range(len(np.unique(y_test)))]
+        nc = len(class_names)
+
+        fig = go.Figure()
+        if nc == 2:
+            fpr, tpr, _ = roc_curve(y_test, y_proba[:, 1])
+            auc = ml.get('best_auc_mean', 0)
+            fig.add_trace(go.Scatter(x=fpr, y=tpr, name=f'AUC={auc:.3f}',
+                                      line=dict(width=2.5, color=px.colors.qualitative.Set2[0])))
+        else:
+            for i in range(nc):
+                fpr, tpr, _ = roc_curve((y_test == i).astype(int), y_proba[:, i])
+                auc_i = roc_auc_score((y_test == i).astype(int), y_proba[:, i])
+                fig.add_trace(go.Scatter(x=fpr, y=tpr, name=f'{class_names[i]} (AUC={auc_i:.3f})',
+                                          line=dict(width=2.5, color=px.colors.qualitative.Set2[i % len(px.colors.qualitative.Set2)])))
+        fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines',
+                                  line=dict(dash='dash', color='gray', width=1.5), showlegend=False))
+        fig.update_layout(title=f"ROC-кривая: {ml.get('best_model', '')}",
+                          xaxis_title="FPR", yaxis_title="TPR",
+                          template="plotly_white", height=450)
+        return fig
+
+    # ==================== HTML БЛОКИ РЕЗУЛЬТАТОВ ====================
+    def generate_html(self, output_path: Path):
+        self.build_plots()
+        plotly_cdn = "https://cdn.plot.ly/plotly-latest.min.js"
+
+        # Маппинг: section_key -> list of (chart_name, chart_title)
         section_charts = {
-            'plots': ['violin', 'boxplot', 'histogram', 'pie', 'scatter', 'correlation', 'interaction'],
-            'linear_regression': ['regression_diagnostics'],
-            'feature_selection': ['rf_importance'],
-            'pca': ['pca'],
-            'cluster': ['elbow', 'kmeans_scatter'],
-            'ml': ['confusion_matrix', 'roc'],
-        }
-        section_subsections = {
-            'anova': [
-                ('3.1', 'One-Way ANOVA / Kruskal-Wallis', ['anova']),
-                ('3.2', 'Post-hoc анализ', ['tukey']),
-                ('3.3', 'Two-Way ANOVA', ['two_way']),
-            ],
-            'manova': [
-                ('4.1', 'MANOVA', ['manova']),
-                ('4.2', 'Post-hoc MANOVA', ['posthoc_manova']),
+            'plots': [
+                ('violin', 'Скрипичная диаграмма'),
+                ('boxplot', 'Ящики с усами (со скобками значимости)'),
+                ('histogram', 'Гистограммы с расширенной статистикой'),
+                ('pie', 'Круговые диаграммы'),
+                ('scatter', 'Скаттерограмма с регрессией'),
+                ('pairgrid', 'Попарные распределения (PairGrid)'),
+                ('correlation', 'Корреляционная матрица'),
+                ('interaction', 'График взаимодействия'),
             ],
             'linear_regression': [
-                ('5.1', 'Линейная регрессия', ['linear_regression']),
-                ('5.3', 'Логистическая регрессия', ['logistic_reg_cat']),
+                ('regression_diagnostics', 'Диагностика регрессии'),
             ],
             'feature_selection': [
-                ('6.2', 'Рекурсивное устранение (RFE)', ['rfe']),
+                ('rf_importance', 'Важность признаков (Random Forest)'),
             ],
             'pca': [
-                ('7.1', 'PCA', ['pca']),
+                ('pca', 'Метод главных компонент (PCA)'),
             ],
             'cluster': [
-                ('8.2', 'K-Means кластеризация', ['kmeans']),
-                ('8.3', 'ANOVA для кластеров', ['cluster_anova']),
+                ('elbow', 'Оптимальное число кластеров (Elbow)'),
+                ('kmeans_scatter', 'K-Means кластеризация (PCA 2D)'),
+                ('cluster_dynamics', 'Профили кластеров (медиана + IQR)'),
+                ('cluster_boxplots', 'Признаки по кластерам'),
             ],
             'ml': [
-                ('9.1', 'ML Бенчмарк', ['ml_benchmark']),
+                ('confusion_matrix', 'Матрица ошибок (лучшая модель)'),
+                ('roc_curve', 'ROC-кривая'),
             ],
         }
 
-        sections_html = ''
-        chart_idx = 0
+        # Секции анализа: key -> (title, subsections)
+        section_defs = [
+            ('preprocessing', '1. Предобработка данных', [
+                ('1.1', 'Статистика предобработки', []),
+                ('1.2', 'Пропуски по столбцам', []),
+                ('1.3', 'Корреляционные связи', []),
+                ('1.4', 'Анализ связей категориальных признаков', []),
+            ]),
+            ('plots', '2. Визуализация', [
+                ('2.1', 'Распределения', ['violin', 'boxplot', 'histogram', 'pie']),
+                ('2.2', 'Зависимости', ['scatter', 'pairgrid', 'correlation', 'interaction']),
+            ]),
+            ('anova', '3. Дисперсионный анализ', [
+                ('3.1', 'One-Way ANOVA / Kruskal-Wallis', []),
+                ('3.2', 'Post-hoc анализ', []),
+                ('3.3', 'Two-Way ANOVA', []),
+            ]),
+            ('manova', '4. Многомерный анализ', [
+                ('4.1', 'MANOVA', []),
+                ('4.2', 'Post-hoc MANOVA', []),
+            ]),
+            ('linear_regression', '5. Регрессионный анализ', [
+                ('5.1', 'Линейная регрессия', []),
+                ('5.2', 'Диагностика регрессии', ['regression_diagnostics']),
+                ('5.3', 'Логистическая регрессия', []),
+            ]),
+            ('feature_selection', '6. Отбор признаков', [
+                ('6.1', 'Важность признаков (RF)', ['rf_importance']),
+                ('6.2', 'Рекурсивное устранение (RFE)', []),
+            ]),
+            ('pca', '7. Метод главных компонент', [
+                ('7.1', 'PCA', ['pca']),
+            ]),
+            ('cluster', '8. Кластерный анализ', [
+                ('8.1', 'Оптимальное число кластеров (Elbow)', ['elbow']),
+                ('8.2', 'K-Means кластеризация (PCA 2D)', ['kmeans_scatter']),
+                ('8.3', 'ANOVA для кластеров', []),
+                ('8.4', 'Профили и boxplot по кластерам', ['cluster_dynamics', 'cluster_boxplots']),
+            ]),
+            ('ml', '9. Машинное обучение', [
+                ('9.1', 'Сравнение методов', []),
+                ('9.2', 'Матрица ошибок и ROC', ['confusion_matrix', 'roc_curve']),
+            ]),
+        ]
 
-        # === Секция предобработки ===
-        stats = self._preprocessing_stats
-        if stats:
-            sections_html += '<div class="section"><h2>1. Предобработка данных</h2>\n'
-            sections_html += (
-                '<table class="stat-table" style="width:60%;">'
-                '<tr><th>Показатель</th><th>Значение</th></tr>'
+        # Результаты анализа: key -> (title, content)
+        analysis_results = {}
+
+        # Build preprocessing results from preprocessing_stats
+        if self.preprocessing_stats:
+            stats = self.preprocessing_stats
+            prep_items = []
+            html_stats = (
+                f'<table class="stat-table" style="width:60%;">'
+                f'<tr><th>Показатель</th><th>Значение</th></tr>'
                 f'<tr><td>Всего строк в исходных данных</td><td>{stats.get("total_rows", 0)}</td></tr>'
                 f'<tr><td>Исключено строк без группирующей переменной ({stats.get("group_col", "")})</td>'
                 f'<td>{stats.get("excluded_no_group", 0)}</td></tr>'
@@ -2335,150 +2930,286 @@ class DataAnalyzer:
                 f'<tr><td>Исключено выбросов (z-score)</td><td>{stats.get("excluded_outliers", 0)}</td></tr>'
                 f'<tr><td><b>Осталось для анализа</b></td><td><b>{stats.get("final_analyzed", 0)}</b></td></tr>'
                 f'<tr><td>Всего исключено</td><td>{stats.get("total_excluded", 0)}</td></tr>'
-                '</table>'
+                f'</table>'
             )
+            prep_items.append(('Статистика предобработки', html_stats))
 
             missing = stats.get('missing_per_column', {})
             if missing:
-                miss_rows = ''.join(f'<tr><td>{col}</td><td>{cnt}</td></tr>' for col, cnt in missing.items() if cnt > 0)
-                if miss_rows:
-                    sections_html += (
-                        '<table class="stat-table" style="width:50%;">'
-                        '<tr><th>Столбец</th><th>Пропусков</th></tr>'
-                        f'{miss_rows}</table>'
-                    )
+                rows = ''.join(f'<tr><td>{col}</td><td>{cnt}</td></tr>' for col, cnt in missing.items() if cnt > 0)
+                if rows:
+                    miss_html = (f'<table class="stat-table" style="width:50%;">'
+                                 f'<tr><th>Столбец</th><th>Пропусков</th></tr>{rows}</table>')
+                    prep_items.append(('Пропуски по столбцам', miss_html))
 
             corr_removals = stats.get('correlation_removals', [])
             corr_threshold = stats.get('correlation_threshold', 0.9)
             corr_pairs = stats.get('corr_pairs', [])
             removal_set = {(k, d) for k, d, _ in corr_removals} if corr_removals else set()
+            corr_parts = []
             if corr_pairs:
-                corr_rows = ''
+                rows = ''
                 for c1, c2, r in corr_pairs:
                     status = 'удалён' if (c1, c2) in removal_set or (c2, c1) in removal_set else 'оставлен'
-                    corr_rows += f'<tr><td>{c1}</td><td>{c2}</td><td>{r:.3f}</td><td>{status}</td></tr>\n'
-                sections_html += (
-                    f'<table class="stat-table" style="width:70%;">'
-                    f'<tr><th>Признак 1</th><th>Признак 2</th><th>|r|</th><th>Статус</th></tr>{corr_rows}</table>'
-                    f'<p>Порог: {corr_threshold}. Показаны все пары с |r| ≥ порога.</p>'
-                )
-            else:
-                sections_html += '<p>Высококоррелированных признаков не обнаружено — все признаки сохранены.</p>'
+                    rows += f'<tr><td>{c1}</td><td>{c2}</td><td>{r:.3f}</td><td>{status}</td></tr>\n'
+                corr_parts.append(f'<table class="stat-table" style="width:70%;">'
+                                  f'<tr><th>Признак 1</th><th>Признак 2</th><th>|r|</th><th>Статус</th></tr>{rows}</table>'
+                                  f'<p>Порог: {corr_threshold}. Показаны все пары с |r| ≥ порога.</p>')
+            if not corr_parts:
+                corr_parts.append('<p>Высококоррелированных признаков не обнаружено — все признаки сохранены.</p>')
+            prep_items.append(('Корреляционные связи', '\n'.join(corr_parts)))
 
-            cat_data = self._analysis_results.get('categorical', {})
-            cat_html = cat_data.get('html', '')
-            if cat_html:
-                sections_html += cat_html
-            else:
-                sections_html += '<p>Значимых связей между категориальными признаками не обнаружено.</p>'
+            cat_html = self.results.get('categorical', {}).get('html', '')
+            if not cat_html:
+                cat_html = '<p>Значимых связей между категориальными признаками не обнаружено.</p>'
+            prep_items.append(('Анализ связей категориальных признаков', cat_html))
 
-            sections_html += '</div>\n'
+            analysis_results['preprocessing'] = prep_items
 
-        for sec_key in ['plots', 'anova', 'manova', 'linear_regression', 'feature_selection', 'pca', 'cluster', 'ml']:
-            if not sections.get(sec_key, False):
+        result_sections = {
+            'anova': [('One-Way ANOVA / Kruskal-Wallis', 'anova'), ('Post-hoc анализ', 'tukey'),
+                      ('Two-Way ANOVA', 'two_way')],
+            'manova': [('MANOVA', 'manova'), ('Post-hoc MANOVA', 'posthoc_manova')],
+            'linear_regression': [('Линейная регрессия', 'linear_regression'),
+                                  ('Логистическая регрессия', 'logistic_reg_cat')],
+            'feature_selection': [('RFE', 'rfe')],
+            'pca': [('PCA', 'pca')],
+            'cluster': [('ANOVA для кластеров', 'cluster_anova')],
+            'ml': [('ML Бенчмарк', 'ml_benchmark')],
+        }
+
+        for sec_key, pairs in result_sections.items():
+            items = []
+            for title, res_key in pairs:
+                data = self.results.get(res_key)
+                if not data: continue
+                content = self._format_result(res_key, data)
+                if content:
+                    items.append((title, content))
+            if sec_key == 'linear_regression' and not any('Логистическая' in t for t, _ in items):
+                items.append(('Логистическая регрессия',
+                              '<p style="color:#7f8c8d; font-style:italic;">'
+                              'Логистическая регрессия не выполнялась: не были выбраны '
+                              'качественные (категориальные) признаки.</p>'))
+            analysis_results[sec_key] = items
+
+        # Сборка HTML по секциям
+        sections_html = ""
+        chart_idx = 0
+        for sec_key, sec_title, subsections in section_defs:
+            if self.sections is not None and sec_key in self.sections and not self.sections.get(sec_key, True):
                 continue
-
-            has_charts = sec_key in section_charts and any(c in plotly_figs for c in section_charts[sec_key])
-            has_subsections = sec_key in section_subsections
-            has_results = False
-            if has_subsections:
-                for _, _, result_keys in section_subsections[sec_key]:
-                    for rk in result_keys:
-                        data = self._analysis_results.get(rk)
-                        if data and (data.get('html') or data.get('text')):
-                            has_results = True
-                            break
+            # Проверяем, есть ли данные для этой секции
+            has_charts = sec_key in section_charts and any(
+                c in self.figures for c, _ in section_charts[sec_key])
+            has_results = sec_key in analysis_results and analysis_results[sec_key]
             if not has_charts and not has_results:
                 continue
 
-            sec_title_map = {
-                'plots': 'Визуализация', 'anova': 'Дисперсионный анализ',
-                'manova': 'Многомерный анализ', 'linear_regression': 'Регрессионный анализ',
-                'feature_selection': 'Отбор признаков', 'pca': 'Метод главных компонент',
-                'cluster': 'Кластерный анализ', 'ml': 'Машинное обучение',
-            }
-            sections_html += f'<div class="section"><h2>{sec_title_map[sec_key]}</h2>\n'
+            sections_html += f'<div class="section" id="section_{sec_key}">\n'
+            sections_html += f'<h2>{sec_title}</h2>\n'
 
-            if sec_key == 'plots' and sec_key in section_charts:
-                for ck in section_charts[sec_key]:
-                    if ck in plotly_figs:
-                        chart_idx += 1
-                        pid = f'plot_{chart_idx}'
-                        fig_json = self._fig_to_json(plotly_figs[ck])
-                        sections_html += f'''<div class="chart-container"><div id="{pid}"></div></div>
-<script>(function(){{ var fig = {fig_json}; var el = document.getElementById('{pid}'); Plotly.newPlot(el, fig.data, fig.layout, {{responsive:true, displayModeBar:true}}); }})();</script>\n'''
+            for sub_num, sub_title, chart_keys in subsections:
+                # Подзаголовок
+                sections_html += f'<h3>{sub_num} {sub_title}</h3>\n'
 
-            if has_subsections:
-                for sub_num, sub_title, result_keys in section_subsections[sec_key]:
-                    sub_has_content = False
-                    sub_content = ''
-
-                    if sec_key in section_charts:
-                        for ck in section_charts[sec_key]:
-                            if ck in plotly_figs and sub_num in ('3.1', '4.1', '5.1', '7.1', '8.2', '9.1'):
-                                chart_idx += 1
-                                pid = f'plot_{sub_num}_{chart_idx}'
-                                fig_json = self._fig_to_json(plotly_figs[ck])
-                                sub_content += f'''<div class="chart-container"><div id="{pid}"></div></div>
-<script>(function(){{ var fig = {fig_json}; var el = document.getElementById('{pid}'); Plotly.newPlot(el, fig.data, fig.layout, {{responsive:true, displayModeBar:true}}); }})();</script>\n'''
-                                sub_has_content = True
-
-                    for rk in result_keys:
-                        data = self._analysis_results.get(rk)
-                        if not data:
-                            continue
-                        content = data.get('html', '')
-                        if not content:
-                            text = data.get('text', '')
-                            if text:
-                                content = f'<pre style="background:#f8f9fa; padding:12px; border-radius:6px;">{text}</pre>'
-                        if content:
-                            sub_content += f'<div class="result-card"><div class="result-content">{content}</div></div>\n'
-                            sub_has_content = True
-
-                    if sub_has_content:
-                        sections_html += f'<h3>{sub_num} {sub_title}</h3>\n'
-                        sections_html += sub_content
-            else:
-                if sec_key in section_charts:
-                    for ck in section_charts[sec_key]:
-                        if ck in plotly_figs:
+                # Графики этой подсекции
+                if chart_keys:
+                    for ck in chart_keys:
+                        if ck in self.figures:
                             chart_idx += 1
-                            pid = f'plot_{chart_idx}'
-                            fig_json = self._fig_to_json(plotly_figs[ck])
-                            sections_html += f'''<div class="chart-container"><div id="{pid}"></div></div>
-<script>(function(){{ var fig = {fig_json}; var el = document.getElementById('{pid}'); Plotly.newPlot(el, fig.data, fig.layout, {{responsive:true, displayModeBar:true}}); }})();</script>\n'''
+                            pid = f"plot_{ck}"
+                            sections_html += f'''
+            <div class="chart-container">
+                <div id="{pid}"></div>
+            </div>
+            <script>
+            (function() {{
+                var fig = {self.figures[ck]};
+                var el = document.getElementById('{pid}');
+                Plotly.newPlot(el, fig.data, fig.layout, {{responsive: true, displayModeBar: true}});
+            }})();
+            </script>'''
+
+                # Результаты этой подсекции
+                if sec_key in analysis_results:
+                    for ridx, (title, content) in enumerate(analysis_results[sec_key]):
+                        # Проверяем, относится ли результат к текущей подсекции
+                        if self._result_matches_subsection(sec_key, title, sub_num, ridx):
+                            sections_html += f'''
+            <div class="result-card">
+                <div class="result-content">{content}</div>
+            </div>'''
 
             sections_html += '</div>\n'
 
-        html = f"""<!DOCTYPE html>
-<html lang="ru"><head>
-<meta charset="UTF-8"><title>Отчёт — {self.file_name}</title>
-<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-<style>
-body {{ font-family: 'Segoe UI', sans-serif; background: #f8f9fa; color: #343a40; margin: 0; padding: 20px; line-height: 1.6; }}
-h1 {{ text-align: center; color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
-h2 {{ color: #2980b9; border-left: 4px solid #3498db; padding-left: 10px; margin-top: 30px; }}
-.section {{ margin-bottom: 20px; }}
-.stat-table {{ border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.95em; }}
-.stat-table th {{ background: #3498db; color: white; padding: 10px 12px; border: 1px solid #2980b9; text-align: left; }}
-.stat-table td {{ padding: 8px 12px; border: 1px solid #d0d7de; }}
-.stat-table tr:nth-child(even) {{ background: #f8f9fa; }}
-.stat-table tr:hover {{ background: #eaf4fc; }}
-.chart-container {{ background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 15px; margin: 15px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }}
-.result-card {{ background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 15px; margin: 15px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }}
-.user-comment {{ background: #fffde7; border-left: 4px solid #fbc02d; padding: 12px 16px; margin: 15px 0; border-radius: 0 6px 6px 0; }}
-</style></head><body>
-<h1>Статистический анализ: {self.file_name}</h1>
-<p style="text-align:center; color:#6c757d;">Группировка: <b>{self.params.get('group','')}</b> | Y: <b>{self.params.get('analysis','')}</b></p>
-{comments_html}
-{sections_html}
-<hr style="margin-top:50px; border:0; border-top:1px solid #eee;">
-<p style="color:#999; font-size:0.8em; text-align:center;">Сгенерировано DataAn Enhanced</p>
-</body></html>"""
-        filename = f"{Path(self.file_name).stem}_report.html"
-        filepath = os.path.join(os.getcwd(), filename)
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(html)
-        print(f'HTML-отчёт сохранён: {filepath}')
-        return filepath
+        # Оставшиеся результаты без секций
+        orphan_results = ""
+        for sec_key, items in analysis_results.items():
+            for ridx, (title, content) in enumerate(items):
+                if not self._result_placed(sec_key, title, section_defs, ridx):
+                    orphan_results += f'''
+            <div class="result-card">
+                <h3>{title}</h3>
+                <div class="result-content">{content}</div>
+            </div>'''
+
+        # Содержание
+        toc_items = []
+        for sec_key, sec_title, _ in section_defs:
+            has_charts = sec_key in section_charts and any(
+                c in self.figures for c, _ in section_charts[sec_key])
+            has_results = sec_key in analysis_results and analysis_results[sec_key]
+            if has_charts or has_results:
+                toc_items.append(f'<a href="#section_{sec_key}">{sec_title}</a>')
+        toc = f'<div class="toc"><b>Содержание:</b>{"".join(toc_items)}</div>' if toc_items else ''
+
+        html_template = f"""
+        <!DOCTYPE html><html lang="ru"><head>
+            <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Интерактивный отчёт</title>
+            <script src="{plotly_cdn}"></script>
+            <style>
+                :root {{ --bg: #f8f9fa; --card: #fff; --txt: #343a40; --brd: #dee2e6; }}
+                * {{ box-sizing: border-box; }}
+                body {{ font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--txt); margin: 0; padding: 10px 20px; line-height: 1.6; }}
+                h1 {{ text-align: center; color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
+                h2 {{ color: #2980b9; border-left: 4px solid #3498db; padding-left: 10px; margin-top: 40px; }}
+                h3 {{ color: #34495e; margin-top: 25px; }}
+                .container {{ width: 100%; max-width: 100%; margin: 0; padding: 0 10px; }}
+                .section {{ margin-bottom: 20px; }}
+                .chart-container {{ background: var(--card); border: 1px solid var(--brd); border-radius: 8px; padding: 15px; margin: 15px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.05); width: 100%; }}
+                .result-card {{ background: var(--card); border: 1px solid var(--brd); border-radius: 8px; padding: 15px; margin: 15px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.05); width: 100%; }}
+                .result-content pre {{ background: #f1f3f5; padding: 15px; border-radius: 4px; overflow-x: auto; white-space: pre-wrap; }}
+                .result-content ul {{ columns: 2; -webkit-columns: 2; }}
+                .result-content li {{ padding: 4px 0; }}
+                .toc {{ background: #f0f7ff; padding: 15px 25px; border-radius: 8px; margin-bottom: 30px; border: 1px solid #d0e3f7; }}
+                .toc a {{ color: #2980b9; text-decoration: none; display: block; padding: 2px 0; }}
+                .toc a:hover {{ text-decoration: underline; }}
+                {self.stat_css}
+            </style></head><body>
+            <div class="container">
+                <h1>Статистический анализ</h1>
+                <p style="text-align: center; color: #6c757d;">Группировка: <b>{self.params.get('group', '')}</b> | Y: <b>{self.params.get('analysis', '')}</b></p>
+                {toc}
+                {sections_html}
+                {orphan_results}
+                <hr style="margin-top: 50px; border: 0; border-top: 1px solid #eee;">
+                <p style="color: #999; font-size: 0.8em; text-align: center;">Сгенерировано DataAn Enhanced v1.1</p>
+            </div>
+            <script>
+            document.querySelectorAll('.stat-table').forEach(function(table) {{
+                var headers = table.querySelectorAll('th');
+                headers.forEach(function(th, colIdx) {{
+                    th.addEventListener('click', function() {{
+                        var tbody = table.querySelector('tbody') || table;
+                        var rows = Array.from(tbody.querySelectorAll('tr:not(:first-child)'));
+                        var isAsc = th.classList.contains('sort-asc');
+                        headers.forEach(function(h) {{ h.classList.remove('sort-asc', 'sort-desc'); }});
+                        rows.sort(function(a, b) {{
+                            var aVal = a.children[colIdx] ? a.children[colIdx].textContent.trim() : '';
+                            var bVal = b.children[colIdx] ? b.children[colIdx].textContent.trim() : '';
+                            var aNum = parseFloat(aVal.replace(/[±✓❌]/g, '').trim());
+                            var bNum = parseFloat(bVal.replace(/[±✓❌]/g, '').trim());
+                            if (!isNaN(aNum) && !isNaN(bNum)) {{
+                                return isAsc ? bNum - aNum : aNum - bNum;
+                            }}
+                            return isAsc ? bVal.localeCompare(aVal, 'ru') : aVal.localeCompare(bVal, 'ru');
+                        }});
+                        th.classList.add(isAsc ? 'sort-desc' : 'sort-asc');
+                        rows.forEach(function(row) {{ tbody.appendChild(row); }});
+                    }});
+                }});
+            }});
+            </script>
+        </body></html>"""
+
+        output_path.write_text(html_template, encoding='utf-8')
+
+    def _format_result(self, key, data):
+        if key == 'ml_benchmark':
+            if data.get('html'): return data['html']
+            tbl = data.get('table', [])
+            if tbl:
+                rows = "".join(f"<tr><td>{r.get('model','')}</td><td>{r.get('accuracy','')}</td><td>{r.get('auc','')}</td></tr>" for r in tbl)
+                return f"<table class='stat-table'><tr><th>Модель</th><th>Accuracy</th><th>AUC</th></tr>{rows}</table>"
+            return ""
+        elif key == 'rf_importance':
+            items_data = data
+            if isinstance(items_data, dict) and 'features' in items_data:
+                items = "".join(f"<li>{f}: {v:.4f}</li>" for f, v in zip(items_data['features'], items_data['values']))
+            else:
+                items = "".join(f"<li>{k}: {v:.4f}</li>" for k, v in sorted(items_data.items(), key=lambda x: x[1], reverse=True))
+            return f"<ul>{items}</ul>"
+        elif key == 'pca':
+            loadings = data.get('loadings', {})
+            n_95 = data.get('n_components_95', '')
+            if loadings:
+                features = list(loadings.keys())
+                pcs = list(next(iter(loadings.values())).keys())
+                header = ''.join(f'<th>{pc}</th>' for pc in pcs)
+                rows_html = ''
+                for f in features:
+                    cells = ''.join(f'<td>{loadings[f].get(pc, 0):.3f}</td>' for pc in pcs)
+                    rows_html += f'<tr><td><b>{f}</b></td>{cells}</tr>\n'
+                table = (f'<p>Для 95% дисперсии необходимо {n_95} компонент(ы).</p>'
+                         f'<table class="stat-table" style="width:auto;">'
+                         f'<tr><th>Признак</th>{header}</tr>\n{rows_html}</table>')
+                return table
+            text = data.get('text', '')
+            return f"<p>{text}</p>" if text else ''
+        elif key == 'rfe':
+            selected = data.get('selected', [])
+            eliminated = data.get('eliminated', [])
+            if not selected and not eliminated:
+                text = data.get('text', '')
+                return f"<p>{text}</p>" if text else ''
+            return (f'<div style="display:flex; gap:20px; flex-wrap:wrap;">'
+                    f'<div style="flex:1; min-width:300px; background:#e8f5e9; border-left:4px solid #4caf50; '
+                    f'padding:12px 16px; border-radius:0 6px 6px 0;">'
+                    f'<b>Рекомендуется оставить ({len(selected)}):</b><br>{", ".join(selected)}</div>'
+                    f'<div style="flex:1; min-width:300px; background:#ffeef0; border-left:4px solid #e53935; '
+                    f'padding:12px 16px; border-radius:0 6px 6px 0;">'
+                    f'<b>Рекомендуется убрать ({len(eliminated)}):</b><br>{", ".join(eliminated)}</div>'
+                    f'</div>')
+        else:
+            content = data.get('html', '')
+            if not content:
+                text = data.get('text', '')
+                if text: content = f"<pre>{text}</pre>"
+            return content or ''
+
+    def _result_matches_subsection(self, sec_key, title, sub_num, ridx=0):
+        if sec_key == 'preprocessing':
+            idx_map = {'1.1': 0, '1.2': 1, '1.3': 2, '1.4': 3}
+            return idx_map.get(sub_num) == ridx
+        mapping = {
+            'preprocessing': {'1.1': ['Статистика', 'предобработк'], '1.2': ['Пропуск'],
+                              '1.3': ['Корреляц'],
+                              '1.4': ['Анализ связей', 'категориальн']},
+            'anova': {'3.1': ['One-Way', 'Kruskal-Wallis', 'Kruskal'], '3.2': ['Post-hoc', 'Tukey', 'Dunn'],
+                      '3.3': ['Two-Way']},
+            'manova': {'4.1': ['MANOVA'], '4.2': ['Post-hoc MANOVA', 'Tukey HSD']},
+            'linear_regression': {'5.1': ['Линейная'], '5.2': ['Диагностика'], '5.3': ['Логистическая']},
+            'feature_selection': {'6.1': [], '6.2': ['RFE']},
+            'pca': {'7.1': ['PCA']},
+            'cluster': {'8.3': ['ANOVA для кластеров']},
+            'ml': {'9.1': ['ML Бенчмарк', 'Сравнение методов'], '9.2': ['Матрица ошибок', 'ROC']},
+        }
+        keywords = mapping.get(sec_key, {}).get(sub_num, [])
+        if not keywords:
+            return False
+        title_lower = title.lower()
+        # Пост-хок блоки не должны попадать в подсекции без явного пост-хок ключевого слова,
+        # иначе «Post-hoc MANOVA» попадёт и в 4.1 (ключевое слово «MANOVA»), продублировав блок 4.2
+        if 'post-hoc' in title_lower and not any('post-hoc' in k.lower() for k in keywords):
+            return False
+        return any(kw.lower() in title_lower for kw in keywords)
+
+    def _result_placed(self, sec_key, title, section_defs, ridx=0):
+        for sk, _, subsections in section_defs:
+            if sk != sec_key: continue
+            for sub_num, _, _ in subsections:
+                if self._result_matches_subsection(sec_key, title, sub_num, ridx):
+                    return True
+        return False
